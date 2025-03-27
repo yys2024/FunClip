@@ -14,19 +14,42 @@ import numpy as np
 import soundfile as sf
 from moviepy.editor import *
 import moviepy.editor as mpy
+from moviepy.config import change_settings
 from moviepy.video.tools.subtitles import SubtitlesClip, TextClip
 from moviepy.editor import VideoFileClip, concatenate_videoclips
 from moviepy.video.compositing.CompositeVideoClip import CompositeVideoClip
 from utils.subtitle_utils import generate_srt, generate_srt_clip
 from utils.argparse_tools import ArgumentParser, get_commandline_args
 from utils.trans_utils import pre_proc, proc, write_state, load_state, proc_spk, convert_pcm_to_float
+import torch
+import torchvision
 
+# 设置 ImageMagick 路径
+IMAGEMAGICK_BINARY = r"E:\Program Files\ImageMagick-7.1.1-Q16-HDRI\magick.exe"
+change_settings({"IMAGEMAGICK_BINARY": IMAGEMAGICK_BINARY})
+
+# 检查是否有可用的 GPU
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"使用设备: {DEVICE}")
 
 class VideoClipper():
     def __init__(self, funasr_model):
-        logging.warning("Initializing VideoClipper.")
         self.funasr_model = funasr_model
         self.GLOBAL_COUNT = 0
+        self.lang = 'zh'  # 默认使用中文
+        self.logger = logging.getLogger()
+        self.logger.warning('Initializing VideoClipper.')
+        self.device = DEVICE
+        
+        # 打印详细的 GPU 信息
+        if torch.cuda.is_available():
+            self.logger.warning(f"GPU 加速已启用:")
+            self.logger.warning(f"- GPU 设备名称: {torch.cuda.get_device_name(0)}")
+            self.logger.warning(f"- CUDA 版本: {torch.version.cuda}")
+            self.logger.warning(f"- 当前使用的 GPU 内存: {torch.cuda.memory_allocated(0)/1024**2:.2f} MB")
+            self.logger.warning(f"- GPU 总内存: {torch.cuda.get_device_properties(0).total_memory/1024**2:.2f} MB")
+        else:
+            self.logger.warning("未检测到 GPU，使用 CPU 处理")
 
     def recog(self, audio_input, sd_switch='no', state=None, hotwords="", output_dir=None):
         if state is None:
@@ -175,7 +198,7 @@ class VideoClipper():
                    start_ost, 
                    end_ost, 
                    state, 
-                   font_size=32, 
+                   font_size=42, 
                    font_color='white', 
                    add_sub=False, 
                    dest_spk=None, 
@@ -186,8 +209,72 @@ class VideoClipper():
         timestamp = state['timestamp']
         sentences = state['sentences']
         video = state['video']
-        clip_video_file = state['clip_video_file']
         video_filename = state['video_filename']
+        
+        # 确保输出目录存在
+        if output_dir is not None:
+            os.makedirs(output_dir, exist_ok=True)
+            # 使用原始文件名作为基础
+            base_name = os.path.splitext(os.path.basename(video_filename))[0]
+            clip_video_file = os.path.join(output_dir, f"{base_name}_clip_no{self.GLOBAL_COUNT}.mp4")
+            temp_audio_file = os.path.join(output_dir, f"{base_name}_tempaudio_no{self.GLOBAL_COUNT}.mp4")
+        else:
+            # 如果没有指定输出目录，使用原始文件所在目录
+            base_name = os.path.splitext(video_filename)[0]
+            clip_video_file = f"{base_name}_clip_no{self.GLOBAL_COUNT}.mp4"
+            temp_audio_file = f"{base_name}_tempaudio_no{self.GLOBAL_COUNT}.mp4"
+        
+        # 使用 GPU 加速视频处理
+        if self.device.type == "cuda":
+            logging.warning("使用 GPU 加速视频处理")
+            # 设置批处理大小
+            BATCH_SIZE = 32
+            
+            def process_frame_batch(frames):
+                # 记录处理前的 GPU 内存使用
+                if torch.cuda.is_available():
+                    before_mem = torch.cuda.memory_allocated(0)
+                
+                # 将帧转换为 PyTorch 张量并移动到 GPU
+                frames_tensor = torch.from_numpy(np.stack(frames)).to(self.device)
+                frames_tensor = frames_tensor.permute(0, 3, 1, 2)  # NHWC to NCHW
+                
+                # 记录处理后的 GPU 内存使用
+                if torch.cuda.is_available():
+                    after_mem = torch.cuda.memory_allocated(0)
+                    logging.warning(f"GPU 内存使用变化: {(after_mem - before_mem)/1024**2:.2f} MB")
+                
+                return frames_tensor
+            
+            def process_video_segment(start, end):
+                segment = video.subclip(start, end)
+                frames = []
+                processed_frames = []
+                
+                # 记录开始时的 GPU 内存使用
+                if torch.cuda.is_available():
+                    start_mem = torch.cuda.memory_allocated(0)
+                
+                # 批量处理帧
+                for frame in segment.iter_frames():
+                    frames.append(frame)
+                    if len(frames) == BATCH_SIZE:
+                        # 处理当前批次
+                        batch_tensor = process_frame_batch(frames)
+                        processed_frames.extend(batch_tensor.cpu().numpy())
+                        frames = []
+                
+                # 处理剩余的帧
+                if frames:
+                    batch_tensor = process_frame_batch(frames)
+                    processed_frames.extend(batch_tensor.cpu().numpy())
+                
+                # 记录结束时的 GPU 内存使用
+                if torch.cuda.is_available():
+                    end_mem = torch.cuda.memory_allocated(0)
+                    logging.warning(f"视频片段处理 GPU 内存使用: {(end_mem - start_mem)/1024**2:.2f} MB")
+                
+                return np.stack(processed_frames)
         
         if timestamp_list is None:
             all_ts = []
@@ -231,12 +318,25 @@ class VideoClipper():
             srt_clip, subs, srt_index = generate_srt_clip(sentences, start, end, begin_index=srt_index, time_acc_ost=time_acc_ost)
             start, end = start+start_ost/1000.0, end+end_ost/1000.0
             video_clip = video.subclip(start, end)
+            
+            # 创建水印
+            w, h = video_clip.size
+            watermark = TextClip("youxiansen", fontsize=36, color='white', stroke_color='black', stroke_width=1, method='caption', size=(w//4, None))
+            watermark = watermark.set_opacity(0.5)  # 设置透明度
+            watermark = watermark.set_position((w-watermark.w-20, h-watermark.h-20))  # 设置位置在右下角，留出20像素边距
+            watermark = watermark.set_duration(video_clip.duration)  # 设置水印持续时间与视频片段相同
+            
+            # 添加水印
+            video_clip = CompositeVideoClip([video_clip, watermark])
+            
             start_end_info = "from {} to {}".format(start, end)
             clip_srt += srt_clip
             if add_sub:
                 generator = lambda txt: TextClip(txt, font='./font/STHeitiMedium.ttc', fontsize=font_size, color=font_color)
                 subtitles = SubtitlesClip(subs, generator)
-                video_clip = CompositeVideoClip([video_clip, subtitles.set_pos(('center','bottom'))])
+                # 计算字幕位置，设置为距底部10%的固定像素值
+                subtitle_y = int(h * 0.85)  # 使用85%的位置，这样字幕会在距底部15%的位置
+                video_clip = CompositeVideoClip([video_clip, subtitles.set_pos(('center', subtitle_y))])
             concate_clip = [video_clip]
             time_acc_ost += end+end_ost/1000.0 - (start+start_ost/1000.0)
             for _ts in ts[1:]:
@@ -250,13 +350,23 @@ class VideoClipper():
                     chi_subs.append(((sub[0][0]-sub_starts, sub[0][1]-sub_starts), sub[1]))
                 start, end = start+start_ost/1000.0, end+end_ost/1000.0
                 _video_clip = video.subclip(start, end)
+                
+                # 为每个片段添加水印
+                w, h = _video_clip.size
+                watermark = TextClip("youxiansen", fontsize=40, color='white', stroke_color='black', stroke_width=1, method='caption', size=(w//4, None))
+                watermark = watermark.set_opacity(0.5)  # 设置透明度
+                watermark = watermark.set_position((w-watermark.w-20, h-watermark.h-20))  # 设置位置在右下角，留出20像素边距
+                watermark = watermark.set_duration(_video_clip.duration)  # 设置水印持续时间与视频片段相同
+                _video_clip = CompositeVideoClip([_video_clip, watermark])
+                
                 start_end_info += ", from {} to {}".format(str(start)[:5], str(end)[:5])
                 clip_srt += srt_clip
                 if add_sub:
                     generator = lambda txt: TextClip(txt, font='./font/STHeitiMedium.ttc', fontsize=font_size, color=font_color)
                     subtitles = SubtitlesClip(chi_subs, generator)
-                    _video_clip = CompositeVideoClip([_video_clip, subtitles.set_pos(('center','bottom'))])
-                    # _video_clip.write_videofile("debug.mp4", audio_codec="aac")
+                    # 计算字幕位置，设置为距底部10%的固定像素值
+                    subtitle_y = int(h * 0.85)  # 使用85%的位置，这样字幕会在距底部15%的位置
+                    _video_clip = CompositeVideoClip([_video_clip, subtitles.set_pos(('center', subtitle_y))])
                 concate_clip.append(copy.copy(_video_clip))
                 time_acc_ost += end+end_ost/1000.0 - (start+start_ost/1000.0)
             message = "{} periods found in the audio: ".format(len(ts)) + start_end_info
@@ -351,6 +461,13 @@ def get_parser():
         default='zh',
         help="language"
     )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=("cuda", "cpu"),
+        default="cuda" if torch.cuda.is_available() else "cpu",
+        help="使用设备 (cuda/cpu)",
+    )
     return parser
 
 
@@ -378,6 +495,7 @@ def runner(stage, file, sd_switch, output_dir, dest_text, dest_spk, start_ost, e
                     vad_model="damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
                     punc_model="damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
                     spk_model="damo/speech_campplus_sv_zh-cn_16k-common",
+                    disable_update=True
                     )
             audio_clipper = VideoClipper(funasr_model)
             audio_clipper.lang = 'zh'
@@ -386,6 +504,7 @@ def runner(stage, file, sd_switch, output_dir, dest_text, dest_spk, start_ost, e
                                 vad_model="damo/speech_fsmn_vad_zh-cn-16k-common-pytorch",
                                 punc_model="damo/punc_ct-transformer_zh-cn-common-vocab272727-pytorch",
                                 spk_model="damo/speech_campplus_sv_zh-cn_16k-common",
+                                disable_update=True
                                 )
             audio_clipper = VideoClipper(funasr_model)
             audio_clipper.lang = 'en'
